@@ -1,10 +1,13 @@
 import maya
 import requests
-import re
+from requests.models import Response
+import json
 import types
 import asyncio
 import aiohttp
+from aiohttp import web
 import urllib
+import re
 
 class BbRest:
     session = ''
@@ -12,7 +15,7 @@ class BbRest:
     version = ''
     functions = {}
 
-    def __init__(self, key, secret, url, headers=None):
+    def __init__(self, key, secret, url, headers=None, threelegoauth=False):
         #these variables are accessible in the class, but not externally.
         self.__key = key
         self.__secret = secret
@@ -60,7 +63,7 @@ class BbRest:
         #use the functions that exist in functions.p,
         #or retrieve from the swagger_json definitions
     
-        swagger_json = requests.get(f'https://developer.blackboard.com/portal/docs/apis/learn-swagger-{version}.json').json()
+        swagger_json = requests.get(f'https://developer.blackboard.com/portal/docs/apis/learn-swagger.json').json()
         p = r'\d+.\d+.\d+'
         functions = []
         for path in swagger_json['paths']:
@@ -72,7 +75,7 @@ class BbRest:
                         'parameters':meta['parameters'],
                         'method':call,
                         'path':path,
-                        #'version':re.findall(p,meta['description'])
+                        'version':re.findall(p,meta['description'])
                     })
        
 
@@ -104,8 +107,8 @@ class BbRest:
         """
 
         #filter out unsupported rest calls, based on current version
-        #functions = [f for f in self.__all_functions if self.is_supported(f)]
-        functions = [f for f in self.__all_functions]
+        functions = [f for f in self.__all_functions if self.is_supported(f)]
+        #functions = [f for f in self.__all_functions]
         
         #generate a dictionary of supported methods
         d_functions = {}
@@ -196,12 +199,15 @@ class BbRest:
 
         if limit == 100:
             async with aiohttp.ClientSession(headers=self.session.headers) as session:
-                #print(url, params)
                 async with session.request(method, url=url, json=payload, params=params) as resp:
-                    return await resp.json()
+                    ret_resp = Response()
+                    ret_resp.status_code = resp.status
+                    ret_resp.error_type = resp.reason
+                    ret_resp._content = await resp.read()
+                    
+                    return ret_resp
 
         tasks = []
-        print(f'Limit is {limit}')
         for i in range(0,limit,100):
             new_params = params.copy()
             new_params['limit'] = 100
@@ -210,10 +216,9 @@ class BbRest:
 
 
         resps = await asyncio.gather(*tasks)
-        
+        resps_json = [resp.json() for resp in resps]
         results = []
-        #print(f'There are {len(resps)} responses')
-        for resp in resps:
+        for resp in resps_json:
             if 'results' in resp:
                 #print(f"There are {len(resp['results'])} results in this response")
                 results.extend(resp['results'])
@@ -226,8 +231,10 @@ class BbRest:
         else:
             resp = {'results':results}
 
-
-        return resp
+        ret_resp = Response()
+        ret_resp.status_code = 200
+        ret_resp._content = json.dumps(resp).encode('utf-8')
+        return ret_resp
 
 
     def call(self, summary, **kwargs):
@@ -262,29 +269,37 @@ class BbRest:
         prepped = self.session.prepare_request(req)
         
         #delete doesn't return json... for some reason
-        if method == 'delete':
-            return self.session.send(prepped)
         
-        resp = self.session.send(prepped).json()
-        cur_resp = resp
+        resp = self.session.send(prepped)
+        cur_resp = resp.json()
+        all_resp = {'results':cur_resp['results']}
 
         if 'results' in cur_resp:
-            while 'paging' in cur_resp and len(resp['results']) < limit:
+            while 'paging' in cur_resp and len(all_resp['results']) < limit:
                 next_page = self.__url + cur_resp['paging']['nextPage']
                 req = requests.Request(method=method, 
                                url=next_page)
                 prepped = self.session.prepare_request(req)
                 cur_resp = self.session.send(prepped).json()
                 if 'results' in cur_resp:
-                    resp['results'].extend(cur_resp['results'])
-            if len(resp['results']) > limit:
-                resp['results'] = resp['results'][:limit]
-                vals = resp['paging']['nextPage'].split('=')
+                    all_resp['results'].extend(cur_resp['results'])
+                if 'paging' in cur_resp:
+                    all_resp['paging'] = cur_resp['paging']
+                else:
+                    del all_resp['paging']
+           
+            if len(all_resp['results']) > limit and 'paging' in cur_resp:
+                all_resp['results'] = all_resp['results'][:limit]
+                print(len(all_resp['results']))
+                vals = cur_resp['paging']['nextPage'].split('=')
                 vals[-1] = str(limit)
-                resp['paging']['nextPage'] = '='.join(vals)
-
-        return resp
-
+                all_resp['paging']['nextPage'] = '='.join(vals)
+        
+        ret_resp = Response()
+        ret_resp.status_code = 200
+        ret_resp._content = json.dumps(all_resp).encode('utf-8')
+        return ret_resp
+        
     
     def is_expired(self):
         return maya.now() > self.expiration_epoch
@@ -358,7 +373,7 @@ def clean_params(parameters):
         return parameters
 
     required = params[0].get('required', [])
-    props = params[0]['properties']
+    props = params[0].get('properties',[])
     for key in props:
         prop_key = f'{key} -optional '
         if key in required:
